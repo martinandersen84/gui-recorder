@@ -7,8 +7,6 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 
 ![GUI Recorder overview](images/overview.png)
 
-> **SQLite only.** MariaDB and PostgreSQL are explicitly rejected during setup with a clear error message.
-
 > [!WARNING]
 > **Use with care.** Purge operations permanently delete recorder history and cannot be undone. The migration flow modifies `configuration.yaml` directly. Always create a full Home Assistant backup before using maintenance or migration features. The authors take no responsibility for data loss.
 
@@ -16,7 +14,7 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 
 - **Sidebar panel** integrated directly into the Home Assistant navigation bar.
 - **Per-device and per-entity control**: enable or disable recording with a toggle — no YAML editing required.
-- **Database statistics**: total / current / obsolete records, matched exclusions, disk size (sums `.db` + `.db-wal` + `.db-shm`), SQLite file path.
+- **Database statistics**: total / current / obsolete records, matched exclusions, database size (for SQLite the `.db` + `.db-wal` + `.db-shm` files, for MariaDB/MySQL and PostgreSQL the size the server reports), database location (password masked).
 - **Maintenance actions**:
   - Purge the database (uses global retention setting).
   - Purge excluded entities (full history, ignores retention).
@@ -101,7 +99,7 @@ To leave `configuration.yaml` clean (recommended), fold `gui_recorder.yaml` back
 ## Requirements
 
 - Home Assistant **2024.1.0** or later.
-- Recorder database on **SQLite** (MariaDB and PostgreSQL are not supported).
+- Recorder database on **SQLite**, **MariaDB/MySQL** or **PostgreSQL**. A custom `db_url`, including a `!secret` reference, is carried over by the migration unchanged.
 
 ## Support
 
