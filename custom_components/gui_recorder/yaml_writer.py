@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import yaml
 
@@ -11,6 +12,8 @@ from .const import DOMAIN
 _ALLOWED_EXCLUDE_KEYS = ("domains", "entity_globs", "event_types")
 _ALLOWED_INCLUDE_KEYS = ("domains", "entity_globs")
 _ALLOWED_TOP_KEYS = {"exclude": _ALLOWED_EXCLUDE_KEYS, "include": _ALLOWED_INCLUDE_KEYS}
+# A YAML tag plus its arguments, e.g. "!secret recorder_db_url" or "!env_var DB_URL default".
+_YAML_TAG_REFERENCE = re.compile(r"^![a-z_]+(?: [^\s#'\"]+)+$")
 
 
 def parse_manual_exclusions(text: str) -> dict[str, dict[str, list[str]]]:
@@ -128,9 +131,15 @@ async def async_write_yaml(hass: HomeAssistant) -> str:
     parts.append(f"purge_keep_days: {purge_keep_days}")
     parts.append(f"commit_interval: {commit_interval}")
     if isinstance(db_url, str) and db_url.strip():
-        # safe_dump quotes the value if the sqlite URL needs it (it usually
-        # doesn't, but the ':' and '///' are safest left to the emitter).
-        parts.append(yaml.safe_dump({"db_url": db_url.strip()}, default_flow_style=False).rstrip())
+        db_url = db_url.strip()
+        if _YAML_TAG_REFERENCE.match(db_url):
+            # Imported as a tag reference ('!secret recorder_db_url'): write it back
+            # verbatim so HA resolves it, rather than a quoted string or the password.
+            parts.append(f"db_url: {db_url}")
+        else:
+            # safe_dump quotes the value if the URL needs it (it usually doesn't,
+            # but the ':' and '///' are safest left to the emitter).
+            parts.append(yaml.safe_dump({"db_url": db_url}, default_flow_style=False).rstrip())
     parts.append("")
 
     if exclude_block:

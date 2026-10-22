@@ -11,6 +11,7 @@ import yaml
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
+from .db_stats import display_db_url
 
 
 @dataclass
@@ -107,9 +108,29 @@ def _detect_active_gui_recorder_include(lines: list[str]) -> bool:
     return False
 
 
+class _TagPreservingLoader(yaml.SafeLoader):
+    """SafeLoader that keeps HA's YAML tags instead of failing on them.
+
+    yaml.safe_load rejects '!secret', '!env_var', '!include' and friends, which made
+    the whole recorder block unreadable as soon as one value used them - typically
+    'db_url: !secret recorder_db_url' on MariaDB/PostgreSQL. A tagged scalar is kept
+    as the literal text ('!secret recorder_db_url') so it can be written back as-is.
+    """
+
+
+def _construct_tagged(loader: yaml.SafeLoader, tag_suffix: str, node: yaml.Node) -> str | None:
+    if isinstance(node, yaml.ScalarNode):
+        return f"!{tag_suffix} {loader.construct_scalar(node)}".rstrip()
+    # A tag on a list/mapping can't be represented; callers treat it as absent.
+    return None
+
+
+_TagPreservingLoader.add_multi_constructor("!", _construct_tagged)
+
+
 def _parse_yaml_text(text: str) -> dict[str, Any] | None:
     try:
-        loaded = yaml.safe_load(text)
+        loaded = yaml.load(text, Loader=_TagPreservingLoader)  # noqa: S506 - SafeLoader subclass
         if isinstance(loaded, dict):
             return loaded
     except Exception:
@@ -117,44 +138,54 @@ def _parse_yaml_text(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    # A tagged value (e.g. 'entities: !include excluded.yaml') parses to a string;
+    # iterating that would yield single characters, so treat it as absent.
+    return list(value) if isinstance(value, list) else []
+
+
 def _extract_summary_from_recorder_config(recorder_cfg: dict[str, Any] | None) -> dict[str, Any]:
-    recorder_cfg = recorder_cfg or {}
-    exclude = recorder_cfg.get("exclude") or {}
-    include = recorder_cfg.get("include") or {}
+    recorder_cfg = _as_dict(recorder_cfg)
+    exclude = _as_dict(recorder_cfg.get("exclude"))
+    include = _as_dict(recorder_cfg.get("include"))
     return {
         "auto_purge": recorder_cfg.get("auto_purge"),
         "auto_repack": recorder_cfg.get("auto_repack"),
         "purge_keep_days": recorder_cfg.get("purge_keep_days"),
         "commit_interval": recorder_cfg.get("commit_interval"),
-        "db_url": recorder_cfg.get("db_url"),
-        "exclude_entities_count": len(exclude.get("entities") or []),
-        "exclude_domains_count": len(exclude.get("domains") or []),
-        "exclude_globs_count": len(exclude.get("entity_globs") or []),
-        "exclude_event_types_count": len(exclude.get("event_types") or []),
-        "include_entities_count": len(include.get("entities") or []),
-        "include_domains_count": len(include.get("domains") or []),
-        "include_globs_count": len(include.get("entity_globs") or []),
+        "db_url": display_db_url(recorder_cfg.get("db_url")),
+        "exclude_entities_count": len(_as_list(exclude.get("entities"))),
+        "exclude_domains_count": len(_as_list(exclude.get("domains"))),
+        "exclude_globs_count": len(_as_list(exclude.get("entity_globs"))),
+        "exclude_event_types_count": len(_as_list(exclude.get("event_types"))),
+        "include_entities_count": len(_as_list(include.get("entities"))),
+        "include_domains_count": len(_as_list(include.get("domains"))),
+        "include_globs_count": len(_as_list(include.get("entity_globs"))),
         "supported_import": {
             "auto_purge": recorder_cfg.get("auto_purge"),
             "auto_repack": recorder_cfg.get("auto_repack"),
             "purge_keep_days": recorder_cfg.get("purge_keep_days"),
             "commit_interval": recorder_cfg.get("commit_interval"),
             "db_url": recorder_cfg.get("db_url"),
-            "excluded_entities": list(exclude.get("entities") or []),
+            "excluded_entities": _as_list(exclude.get("entities")),
         },
         # Filters GUI Recorder doesn't manage per-entity but can still carry over
         # verbatim into the manual exclusions block (exclude/include entities are
         # explicitly excluded - those stay exclusive to the entity toggles).
         "unsupported_filters": {
             "exclude": {
-                key: list(exclude.get(key) or [])
+                key: _as_list(exclude.get(key))
                 for key in ("domains", "entity_globs", "event_types")
-                if exclude.get(key)
+                if _as_list(exclude.get(key))
             },
             "include": {
-                key: list(include.get(key) or [])
+                key: _as_list(include.get(key))
                 for key in ("domains", "entity_globs")
-                if include.get(key)
+                if _as_list(include.get(key))
             },
         },
     }
@@ -222,6 +253,9 @@ def _detect_sync_status(hass: HomeAssistant) -> dict[str, Any]:
 
 async def async_detect_sync_status(hass: HomeAssistant) -> dict[str, Any]:
     status = await hass.async_add_executor_job(_detect_sync_status, hass)
+    # This status goes to the browser; the import reads the raw db_url server-side.
+    supported = status["legacy_summary"]["supported_import"]
+    supported["db_url"] = display_db_url(supported.get("db_url"))
     data = hass.data.get(DOMAIN, {}).get("data", {})
     status["legacy_imported_at"] = data.get("legacy_imported_at")
     return status
@@ -335,15 +369,13 @@ def _import_legacy_sync(hass: HomeAssistant) -> dict[str, Any]:
         if value is not None:
             updates[key] = bool(value)
 
-    # Preserve a custom SQLite db_url (e.g. a database moved to /share). The
-    # recorder only reads db_url from its own config, so dropping it on migration
-    # made HA silently start a fresh empty DB at the default path. Only carry over
-    # sqlite URLs - non-sqlite backends can't reach this point anyway (setup aborts
-    # on them), but guard defensively.
+    # Preserve a custom db_url (a SQLite database moved to /share, or a
+    # MariaDB/PostgreSQL server). The recorder only reads db_url from its own
+    # config, so dropping it on migration made HA silently start a fresh empty
+    # SQLite DB at the default path. A '!secret ...' reference is kept as-is.
     db_url = supported.get("db_url")
     if isinstance(db_url, str) and db_url.strip():
-        if db_url.strip().lower().startswith("sqlite"):
-            updates["db_url"] = db_url.strip()
+        updates["db_url"] = db_url.strip()
 
     # Domain/glob/event_type filters can't be managed per-entity, but unlike
     # entities they can be carried over verbatim as YAML into the manual
@@ -377,7 +409,7 @@ def _import_legacy_sync(hass: HomeAssistant) -> dict[str, Any]:
             "auto_repack": updates.get("auto_repack"),
             "commit_interval": updates.get("commit_interval"),
             "manual_exclusions": bool(manual_block),
-            "db_url": updates.get("db_url"),
+            "db_url": display_db_url(updates.get("db_url")),
         },
         "unsupported": unsupported,
         "source": status.get("legacy_source_path"),
