@@ -16,6 +16,16 @@ from .const import DOMAIN, INTEGRATION_VERSION
 from .db_stats import async_analyze_db
 from .migration import async_detect_sync_status, async_disable_legacy, async_ensure_gui_enabled, async_import_legacy
 from .storage import async_reload_data, async_save_data
+from .throttle import (
+    DEFAULT_PRECISION,
+    MAX_WINDOW_SECONDS,
+    MIN_WINDOW_SECONDS,
+    async_build_filter_links,
+    async_create_throttled_sensor,
+    async_filter_flow_supported,
+    is_numeric_state,
+    yaml_snippet,
+)
 from .yaml_writer import async_write_yaml, parse_manual_exclusions
 
 _LOGGER = logging.getLogger(__name__)
@@ -189,6 +199,13 @@ def _build_rows(hass: HomeAssistant) -> dict:
 
     stats_payload = _build_stats_payload(hass)
     entity_counts = stats_payload.get("entity_counts", {})
+    filters_by_source, filters_by_filtered = async_build_filter_links(hass)
+
+    def _add_filter_links(row: dict) -> dict:
+        row["filters"] = filters_by_source.get(row["entity_id"], [])
+        link = filters_by_filtered.get(row["entity_id"])
+        row["filter_of"] = link["source_entity_id"] if link else None
+        return row
 
     devices: dict[str, dict] = {}
     orphan_entities: list[dict] = []
@@ -213,6 +230,7 @@ def _build_rows(hass: HomeAssistant) -> dict:
             "glob_hidden": row_hidden,
             "record_count": int(entity_counts.get(entity_entry.entity_id, 0)),
         }
+        _add_filter_links(row)
 
         if entity_entry.device_id:
             device = device_registry.async_get(entity_entry.device_id)
@@ -248,7 +266,7 @@ def _build_rows(hass: HomeAssistant) -> dict:
             friendly_name = state_obj.attributes.get("friendly_name") if state_obj else None
             current_entity_ids.add(entity_id)
             orphan_entities.append(
-                {
+                _add_filter_links({
                     "entity_id": entity_id,
                     "name": friendly_name or entity_id,
                     "disabled_by": None,
@@ -259,7 +277,7 @@ def _build_rows(hass: HomeAssistant) -> dict:
                     "recorded": _row_flags(entity_id)[0],
                     "glob_hidden": _row_flags(entity_id)[1],
                     "record_count": int(count),
-                }
+                })
             )
             continue
         obsolete_entities.append(
@@ -320,6 +338,7 @@ def _build_rows(hass: HomeAssistant) -> dict:
         "matched_exclusions": matched_exclusions,
         "unmatched_exclusions": unmatched_exclusions,
         "manual_exclusions_yaml": data.get("manual_exclusions_yaml", ""),
+        "filter_flow_supported": bool(hass.data[DOMAIN].get("filter_flow_supported", False)),
         "version": INTEGRATION_VERSION,
     }
 
@@ -736,7 +755,81 @@ async def ws_enable_gui(hass: HomeAssistant, connection: websocket_api.ActiveCon
     connection.send_result(msg["id"], result)
 
 
+@websocket_api.require_admin
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gui_recorder/create_throttled_sensor",
+        vol.Required("entity_id"): str,
+        vol.Required("window_seconds"): vol.All(vol.Coerce(int), vol.Range(min=MIN_WINDOW_SECONDS, max=MAX_WINDOW_SECONDS)),
+        vol.Optional("name"): str,
+        vol.Optional("precision", default=DEFAULT_PRECISION): vol.All(vol.Coerce(int), vol.Range(min=0, max=10)),
+        vol.Optional("exclude_source", default=True): bool,
+    }
+)
+async def ws_create_throttled_sensor(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    """Issue #23: create a Filter/time_throttle helper and (optionally) stop recording the source."""
+    source = _normalize_entity_id(msg["entity_id"])
+    if not source.startswith("sensor."):
+        connection.send_result(msg["id"], {"ok": False, "error": "Only sensor entities can be throttled."})
+        return
+    state = hass.states.get(source)
+    if state is None:
+        connection.send_result(msg["id"], {"ok": False, "error": f"{source} has no current state in Home Assistant."})
+        return
+    if is_numeric_state(hass, source) is False:
+        connection.send_result(
+            msg["id"],
+            {"ok": False, "error": f"{source} does not report a numeric value; the Filter integration only works with numeric sensors."},
+        )
+        return
+
+    name = (msg.get("name") or "").strip() or f"{state.attributes.get('friendly_name') or source} throttled"
+
+    if not await async_filter_flow_supported(hass):
+        # Older HA: the Filter integration is YAML-only. Hand back the snippet instead.
+        connection.send_result(
+            msg["id"],
+            {"ok": False, "unsupported": True, "yaml": yaml_snippet(source, name, msg["window_seconds"]),
+             "error": "This Home Assistant version cannot create Filter helpers from the UI. Add the YAML below to configuration.yaml instead."},
+        )
+        return
+
+    created = await async_create_throttled_sensor(hass, source, name, msg["window_seconds"], msg["precision"])
+    if not created.get("ok"):
+        connection.send_result(msg["id"], created)
+        return
+
+    data = await async_reload_data(hass)
+    excluded_source = False
+    if msg["exclude_source"]:
+        if _apply_toggle(data, {source}, False):
+            data["pending_restart"] = True
+            data = await _save_and_reload(hass, data)
+        excluded_source = source in set(data.get("excluded_entities", []))
+
+    # The new helper must itself be recorded - warn if one of the user's own
+    # exclude globs/domains (e.g. "sensor.*power*") would hide it.
+    filtered_id = created.get("entity_id")
+    domains, pattern = _manual_exclude_filters(data)
+    filtered_hidden = bool(filtered_id) and _is_glob_hidden(filtered_id, domains, pattern)
+
+    connection.send_result(
+        msg["id"],
+        {
+            "ok": True,
+            "entry_id": created.get("entry_id"),
+            "entity_id": filtered_id,
+            "name": name,
+            "excluded_source": excluded_source,
+            "filtered_glob_hidden": filtered_hidden,
+            "restart_required": excluded_source,
+        },
+    )
+
+
 async def async_setup_websocket_api(hass: HomeAssistant) -> None:
+    hass.data.setdefault(DOMAIN, {})["filter_flow_supported"] = await async_filter_flow_supported(hass)
     websocket_api.async_register_command(hass, ws_get_tree)
     websocket_api.async_register_command(hass, ws_set_entity)
     websocket_api.async_register_command(hass, ws_set_device)
@@ -758,3 +851,4 @@ async def async_setup_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_import_legacy)
     websocket_api.async_register_command(hass, ws_disable_legacy)
     websocket_api.async_register_command(hass, ws_enable_gui)
+    websocket_api.async_register_command(hass, ws_create_throttled_sensor)
