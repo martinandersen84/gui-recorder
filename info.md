@@ -7,6 +7,7 @@ A Home Assistant sidebar panel to manage your `recorder` configuration and datab
 - Enable or disable recording per device and per entity with a toggle.
 - Database statistics: total / current / obsolete records, matched exclusions, disk size, SQLite path.
 - Maintenance actions: purge the database, purge excluded entities (full history), repack, restart HA.
+- Throttle noisy sensors: create a Filter `time_throttle` helper and stop recording the raw sensor in one click.
 - Detects orphan exclusions (entries that no longer match any entity) and removes them in bulk.
 - Guided migration from a legacy `recorder:` block in `configuration.yaml`.
 

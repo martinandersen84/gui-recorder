@@ -23,6 +23,7 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
   - Auto-update stats after each purge (optional).
   - Repack after manual purge (optional).
   - Restart Home Assistant.
+- **Throttle noisy sensors**: for fast-updating sensors (power meters, system sensors…) the *Throttle* button creates a [Filter](https://www.home-assistant.io/integrations/filter/) helper with `time_throttle` (e.g. one update per minute) and excludes the raw sensor from the recorder in one step. The helper is a normal HA helper — edit or delete it in **Settings → Devices & services → Helpers**. Requires a Home Assistant version where the Filter integration can be set up from the UI; on older versions the panel shows the equivalent YAML instead.
 - **Orphan exclusion detection**: shows entries in `gui_recorder.yaml` that no longer match any entity, with a one-click bulk-remove.
 - **Guided migration**: imports your existing `recorder` configuration from `configuration.yaml` in 3 steps (import → disable old block → activate `!include`).
 - **Cache busting**: the panel JS is served with `?v=VERSION` to prevent stale versions after updates.

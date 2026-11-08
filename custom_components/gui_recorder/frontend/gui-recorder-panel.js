@@ -40,6 +40,7 @@ class GuiRecorderPanel extends HTMLElement {
     this._manualExclusionsValue = "";
     this._manualExclusionsError = "";
     this._savingManualExclusions = false;
+    this._throttleDialog = null;
   }
 
   set hass(hass) {
@@ -676,6 +677,147 @@ class GuiRecorderPanel extends HTMLElement {
     `;
   }
 
+  _findEntity(entityId) {
+    for (const device of this._data.devices || []) {
+      const found = (device.entities || []).find((e) => e.entity_id === entityId);
+      if (found) return found;
+    }
+    return (this._data.orphans || []).find((e) => e.entity_id === entityId) || null;
+  }
+
+  _formatWindow(seconds) {
+    const total = Number(seconds || 0);
+    if (!total) return "";
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    return [h ? `${h} h` : "", m ? `${m} min` : "", s ? `${s} s` : ""].filter(Boolean).join(" ");
+  }
+
+  _filterNote(entity) {
+    const notes = [];
+    for (const f of entity.filters || []) {
+      const target = f.entity_id ? `<code>${this._escapeHtml(f.entity_id)}</code>` : this._escapeHtml(f.title || "filter helper");
+      const what = f.filter === "time_throttle" && f.window_seconds ? `throttled every ${this._escapeHtml(this._formatWindow(f.window_seconds))}` : `filter: ${this._escapeHtml(f.filter || "?")}`;
+      notes.push(`<div class="row-note filter-note">→ ${target} (${what})${f.disabled ? " · disabled" : ""}</div>`);
+    }
+    if (entity.filter_of) {
+      notes.push(`<div class="row-note filter-note">filtered copy of <code>${this._escapeHtml(entity.filter_of)}</code></div>`);
+    }
+    return notes.join("");
+  }
+
+  _throttleButton(entity, disabled = false) {
+    // Only raw sensors: a Filter helper on top of a Filter helper is never what you want here.
+    if (entity.domain !== "sensor" || entity.filter_of) return "";
+    return `<button class="mini-button" ${disabled ? "disabled" : ""} data-throttle-entity="${this._escapeHtml(entity.entity_id)}" title="Create a throttled copy that is recorded instead of this sensor">Throttle</button>`;
+  }
+
+  _openThrottleDialog(entityId) {
+    const entity = this._findEntity(entityId);
+    const state = this._hass?.states?.[entityId];
+    const friendly = state?.attributes?.friendly_name || entity?.name || entityId;
+    this._throttleDialog = {
+      entityId,
+      name: `${friendly} throttled`,
+      minutes: 1,
+      seconds: 0,
+      excludeSource: true,
+      hasStatistics: Boolean(state?.attributes?.state_class),
+      nonNumeric: Boolean(state) && !["unknown", "unavailable"].includes(state.state) && Number.isNaN(Number(state.state)),
+      existing: (entity?.filters || []).length,
+      busy: false,
+      error: "",
+      yaml: "",
+    };
+    this._render();
+    this.shadowRoot.getElementById("throttle-name")?.focus();
+  }
+
+  _closeThrottleDialog() {
+    if (this._throttleDialog?.busy) return;
+    this._throttleDialog = null;
+    this._render();
+  }
+
+  async _submitThrottle() {
+    const d = this._throttleDialog;
+    if (!d || d.busy) return;
+    const windowSeconds = Math.round(Number(d.minutes || 0) * 60 + Number(d.seconds || 0));
+    if (!Number.isFinite(windowSeconds) || windowSeconds < 1 || windowSeconds > 86399) {
+      d.error = "The update interval must be between 1 second and 23:59:59.";
+      this._render();
+      return;
+    }
+    d.busy = true;
+    d.error = "";
+    d.yaml = "";
+    this._render();
+    try {
+      const result = await this._hass.connection.sendMessagePromise({
+        type: "gui_recorder/create_throttled_sensor",
+        entity_id: d.entityId,
+        name: String(d.name || "").trim(),
+        window_seconds: windowSeconds,
+        exclude_source: Boolean(d.excludeSource),
+      });
+      if (!result?.ok) {
+        d.busy = false;
+        d.error = result?.error || "Could not create the throttled sensor.";
+        d.yaml = result?.yaml || "";
+        this._render();
+        return;
+      }
+      const created = result.entity_id ? `${result.entity_id}` : `"${result.name}"`;
+      const parts = [`Created ${created}, updating at most every ${this._formatWindow(windowSeconds)}.`];
+      if (result.excluded_source) parts.push(`${d.entityId} is now excluded from the recorder — restart Home Assistant to apply it.`);
+      if (result.filtered_glob_hidden) parts.push(`Warning: ${created} is hidden by one of your manual exclude globs/domains — switch it on in its row so it gets recorded.`);
+      this._throttleDialog = null;
+      this._message = parts.join(" ");
+      await this._refreshTreeData();
+      this._render();
+    } catch (err) {
+      d.busy = false;
+      d.error = `Could not create the throttled sensor: ${err?.message || err}`;
+      this._render();
+    }
+  }
+
+  _throttleDialogMarkup() {
+    const d = this._throttleDialog;
+    if (!d) return "";
+    return `
+      <div class="dialog-backdrop" id="throttle-backdrop">
+        <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="throttle-title">
+          <h2 id="throttle-title">Throttle a noisy sensor</h2>
+          <div class="row-note" style="margin-bottom:12px;">Creates a <strong>Filter helper</strong> (<code>time_throttle</code>) based on <code>${this._escapeHtml(d.entityId)}</code>. It updates at most once per interval and is recorded instead of the raw sensor. You can edit or delete it later in <em>Settings → Devices &amp; services → Helpers</em>.</div>
+          ${d.existing ? `<div class="message warn">This sensor already has ${d.existing} filter helper${d.existing === 1 ? "" : "s"}.</div>` : ""}
+          ${d.nonNumeric ? `<div class="message warn">The current state is not numeric. The Filter integration only works with numeric sensors.</div>` : ""}
+          <div class="dialog-grid">
+            <label class="stat-label" for="throttle-name">Name of the new sensor</label>
+            <input id="throttle-name" type="text" value="${this._escapeHtml(d.name)}" ${d.busy ? "disabled" : ""}>
+            <label class="stat-label">Update at most every</label>
+            <div class="dialog-inline">
+              <input id="throttle-minutes" type="number" min="0" max="1439" step="1" value="${this._escapeHtml(d.minutes)}" ${d.busy ? "disabled" : ""}><span>min</span>
+              <input id="throttle-seconds" type="number" min="0" max="59" step="1" value="${this._escapeHtml(d.seconds)}" ${d.busy ? "disabled" : ""}><span>s</span>
+            </div>
+          </div>
+          <label class="dialog-check">
+            <input id="throttle-exclude" type="checkbox" ${d.excludeSource ? "checked" : ""} ${d.busy ? "disabled" : ""}>
+            <span>Stop recording <code>${this._escapeHtml(d.entityId)}</code> (adds it to <code>exclude.entities</code>; needs a restart)</span>
+          </label>
+          ${d.excludeSource && d.hasStatistics ? `<div class="message warn"><strong>This sensor has long-term statistics.</strong> Excluding it also stops its statistics. If it is used in the Energy dashboard or in statistics cards, point them to the new sensor (it keeps the same unit and state_class) — its history starts from now.</div>` : ""}
+          ${d.error ? `<div class="message warn">${this._escapeHtml(d.error)}</div>` : ""}
+          ${d.yaml ? `<textarea readonly rows="8" style="margin-top:8px;">${this._escapeHtml(d.yaml)}</textarea>` : ""}
+          <div class="dialog-actions">
+            <button class="action-button" id="throttle-cancel" ${d.busy ? "disabled" : ""}>Cancel</button>
+            <button class="action-button primary" id="throttle-create" ${d.busy || d.yaml ? "disabled" : ""}>${d.busy ? "Creating…" : "Create throttled sensor"}</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   _purgeButton(entityId, deviceId = null, disabled = false) {
     return `<button class="mini-button" ${disabled ? "disabled" : ""} data-purge-entity="${this._escapeHtml(entityId)}" ${deviceId ? `data-device-id="${this._escapeHtml(deviceId)}"` : ""}>Purge</button>`;
   }
@@ -772,6 +914,18 @@ class GuiRecorderPanel extends HTMLElement {
         }
         .right { text-align:right; white-space:nowrap; }
         .actions-cell { display:flex; align-items:center; gap:10px; justify-content:flex-start; flex-wrap:wrap; }
+        .filter-note { margin-top:4px; }
+        .dialog-backdrop { position:fixed; inset:0; z-index:100; background:rgba(0,0,0,0.45); display:flex; align-items:center; justify-content:center; padding:16px; box-sizing:border-box; }
+        .dialog { background:var(--card-background-color); color:var(--primary-text-color); border-radius:12px; border:1px solid var(--divider-color); padding:20px; width:100%; max-width:560px; max-height:calc(100vh - 32px); overflow:auto; box-shadow:0 8px 32px rgba(0,0,0,0.35); box-sizing:border-box; }
+        .dialog-grid { display:grid; gap:8px; margin-top:8px; }
+        .dialog-grid .stat-label { margin:6px 0 0; }
+        .dialog input[type="text"] { width:100%; padding:10px 12px; border-radius:10px; border:1px solid var(--divider-color); background:var(--primary-background-color); color:var(--primary-text-color); box-sizing:border-box; font:inherit; }
+        .dialog-inline { display:flex; align-items:center; gap:8px; }
+        .dialog-inline input[type="number"] { width:90px; }
+        .dialog-check { display:flex; gap:10px; align-items:flex-start; margin-top:16px; cursor:pointer; }
+        .dialog-check input { margin-top:3px; }
+        .dialog-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:18px; flex-wrap:wrap; }
+        .action-button.primary { background:var(--primary-color); color:var(--text-primary-color, #fff); border-color:var(--primary-color); }
       </style>
       <div class="wrap">
         ${this._data.pending_restart ? `<div class="notice pending sticky"><strong>Pending changes.</strong> Restart Home Assistant so Recorder can apply the new configuration.</div>` : ""}
@@ -964,8 +1118,8 @@ class GuiRecorderPanel extends HTMLElement {
                               <td>${this._escapeHtml(entity.platform || "")}</td>
                               <td class="right">${this._formatNumber(entity.record_count || 0)}</td>
                               <td class="right">${this._escapeHtml(this._formatPercent(entity.record_count || 0, totalRows))}</td>
-                              <td>${this._switchMarkup({ checked: entity.recorded, disabled: entityBusy, entityId: entity.entity_id, deviceId: device.device_id, kind: "entity" })}${entityBusy ? `<span class="pending-dot" title="Saving"></span>` : ""}${this._globNote(entity)}</td>
-                              <td><div class="actions-cell">${this._purgeButton(entity.entity_id, device.device_id, purgeActionBusy || purgeBusy || !entity.record_count)}${purgeBusy ? `<span class="pending-dot" title="Purging"></span>` : ""}</div></td>
+                              <td>${this._switchMarkup({ checked: entity.recorded, disabled: entityBusy, entityId: entity.entity_id, deviceId: device.device_id, kind: "entity" })}${entityBusy ? `<span class="pending-dot" title="Saving"></span>` : ""}${this._globNote(entity)}${this._filterNote(entity)}</td>
+                              <td><div class="actions-cell">${this._purgeButton(entity.entity_id, device.device_id, purgeActionBusy || purgeBusy || !entity.record_count)}${this._throttleButton(entity, entityBusy)}${purgeBusy ? `<span class="pending-dot" title="Purging"></span>` : ""}</div></td>
                             </tr>
                           `;
                         }).join("")}
@@ -1011,8 +1165,8 @@ class GuiRecorderPanel extends HTMLElement {
                       <td>${this._escapeHtml(entity.platform || "")}</td>
                       <td class="right">${this._formatNumber(entity.record_count || 0)}</td>
                       <td class="right">${this._escapeHtml(this._formatPercent(entity.record_count || 0, totalRows))}</td>
-                      <td>${this._switchMarkup({ checked: entity.recorded, disabled: entityBusy, entityId: entity.entity_id, kind: "entity" })}${entityBusy ? `<span class="pending-dot" title="Saving"></span>` : ""}${this._globNote(entity)}</td>
-                      <td><div class="actions-cell">${this._purgeButton(entity.entity_id, null, purgeActionBusy || purgeBusy || !entity.record_count)}${purgeBusy ? `<span class="pending-dot" title="Purging"></span>` : ""}</div></td>
+                      <td>${this._switchMarkup({ checked: entity.recorded, disabled: entityBusy, entityId: entity.entity_id, kind: "entity" })}${entityBusy ? `<span class="pending-dot" title="Saving"></span>` : ""}${this._globNote(entity)}${this._filterNote(entity)}</td>
+                      <td><div class="actions-cell">${this._purgeButton(entity.entity_id, null, purgeActionBusy || purgeBusy || !entity.record_count)}${this._throttleButton(entity, entityBusy)}${purgeBusy ? `<span class="pending-dot" title="Purging"></span>` : ""}</div></td>
                     </tr>
                   `;
                 }).join("")}
@@ -1089,6 +1243,7 @@ class GuiRecorderPanel extends HTMLElement {
         `}
 
       </div>
+      ${this._throttleDialogMarkup()}
     `;
 
     if (filterWasFocused) {
@@ -1201,6 +1356,24 @@ class GuiRecorderPanel extends HTMLElement {
         this._purgeEntity(entityId, deviceId || null);
       });
     });
+    this.shadowRoot.querySelectorAll("[data-throttle-entity]").forEach((el) => {
+      el.addEventListener("click", (ev) => this._openThrottleDialog(ev.currentTarget.getAttribute("data-throttle-entity")));
+    });
+    if (this._throttleDialog) {
+      const d = this._throttleDialog;
+      const root = this.shadowRoot;
+      root.getElementById("throttle-name")?.addEventListener("input", (ev) => { d.name = ev.target.value; });
+      root.getElementById("throttle-minutes")?.addEventListener("input", (ev) => { d.minutes = ev.target.value; });
+      root.getElementById("throttle-seconds")?.addEventListener("input", (ev) => { d.seconds = ev.target.value; });
+      root.getElementById("throttle-exclude")?.addEventListener("change", (ev) => { d.excludeSource = ev.target.checked; this._render(); });
+      root.getElementById("throttle-cancel")?.addEventListener("click", () => this._closeThrottleDialog());
+      root.getElementById("throttle-create")?.addEventListener("click", () => this._submitThrottle());
+      root.getElementById("throttle-backdrop")?.addEventListener("click", (ev) => { if (ev.target === ev.currentTarget) this._closeThrottleDialog(); });
+      root.querySelector(".dialog")?.addEventListener("keydown", (ev) => {
+        if (ev.key === "Escape") this._closeThrottleDialog();
+        if (ev.key === "Enter" && ev.target?.tagName === "INPUT" && ev.target.type !== "checkbox") this._submitThrottle();
+      });
+    }
     this.shadowRoot.querySelectorAll("[data-purge-device]").forEach((el) => {
       if (el.dataset.bound === "1") return;
       el.dataset.bound = "1";
